@@ -1,8 +1,10 @@
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
 from services.manager import get_manager
 from routers import llm, tts, vision
 from config import settings
+from gui_app import build_gui
 import logging
 
 # Configure logging
@@ -22,6 +24,9 @@ app.include_router(llm.router)
 app.include_router(tts.router)
 app.include_router(vision.router)
 
+# GUI
+build_gui(app)
+
 @app.on_event("startup")
 def startup_event():
     logger.info("🚀 Starting SentryBOT Server Application...")
@@ -34,7 +39,12 @@ def startup_event():
             logger.error(f"❌ Initialization failed: {e}")
 
 @app.get("/")
-def root():
+def root_redirect():
+    return RedirectResponse(url="/ui")
+
+
+@app.get("/api/status")
+def api_status():
     return {
         "status": "online",
         "app": "SentryBOT Server",

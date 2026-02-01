@@ -1,56 +1,41 @@
 import logging
 import cv2
 import numpy as np
-from typing import Dict, Any, List
+import requests
+from typing import Dict, Any, List, Optional
 from services.base import BaseService
 from config import settings
+from services.vision import ObjectDetector, HandDetector, FaceAnalyzer
 
 logger = logging.getLogger(__name__)
 
 class VisionService(BaseService):
     def __init__(self):
-        self.yolo_model = None
-        self.face_model = None # DeepFace or similar
-        self.hands = None # MediaPipe
+        self.object_detector = ObjectDetector(settings.yolo_model_path)
+        self.hand_detector = HandDetector()
+        self.face_analyzer = FaceAnalyzer()
 
     def initialize(self):
         if not settings.vision_enabled:
             return
+        self.object_detector.load()
+        self.hand_detector.load()
+        self.face_analyzer.load()
 
-        # 1. YOLO Object Detection
-        try:
-            from ultralytics import YOLO
-            self.yolo_model = YOLO(settings.yolo_model_path)
-            logger.info("YOLO model loaded.")
-        except Exception as e:
-            logger.warning(f"YOLO load failed: {e}")
-
-        # 2. MediaPipe Hands
-        try:
-            import mediapipe as mp
-            self.mp_hands = mp.solutions.hands
-            self.hands = self.mp_hands.Hands(static_image_mode=True, max_num_hands=2, min_detection_confidence=0.5)
-            logger.info("MediaPipe Hands loaded.")
-        except Exception as e:
-            logger.warning(f"MediaPipe Hands load failed: {e}")
-        
-        # 3. DeepFace (Face Rec + Attributes)
-        # DeepFace loads models on first use usually, but we can try to pre-import
-        try:
-            from deepface import DeepFace
-            self.DeepFace = DeepFace
-            logger.info("DeepFace module loaded.")
-        except Exception as e:
-            logger.warning(f"DeepFace load failed: {e}")
-            self.DeepFace = None
-
-    def process_image(self, image_bytes: bytes, modalities: List[str] = None) -> Dict[str, Any]:
+    def process_image(self, image_bytes: bytes, mode: Optional[str] = None, modalities: List[str] = None) -> Dict[str, Any]:
         """
         Process image bytes.
-        modalities: list of 'object', 'face', 'hand', 'attributes'
+        mode: single 'object' | 'face' | 'hand' | 'attributes'
+        modalities: list (deprecated) -> only one allowed
         """
-        if modalities is None:
-            modalities = ["object", "face", "hand", "attributes"]
+        if mode:
+            modes = [mode]
+        else:
+            modes = modalities or ["object"]
+        modes = [m for m in modes if m]
+        if len(modes) != 1:
+            raise ValueError("Only one processing mode is allowed")
+        mode = modes[0]
 
         # Decode image
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -60,83 +45,51 @@ class VisionService(BaseService):
 
         results = {}
 
-        # OBJECTS
-        if "object" in modalities and self.yolo_model:
-            results["objects"] = self._detect_objects(img)
+        if mode == "object":
+            if not self.object_detector.available:
+                results["error"] = "object detector not available"
+            else:
+                results["objects"] = self.object_detector.detect(img)
+        elif mode == "hand":
+            if not self.hand_detector.available:
+                results["error"] = "hand detector not available"
+            else:
+                results["hands"] = self.hand_detector.detect(img)
+        elif mode == "face":
+            if not self.face_analyzer.available:
+                results["error"] = "face analyzer not available"
+            else:
+                results["faces"] = self.face_analyzer.analyze(img, "face")
+        elif mode == "attributes":
+            if not self.face_analyzer.available:
+                results["error"] = "face analyzer not available"
+            else:
+                results["faces"] = self.face_analyzer.analyze(img, "attributes")
+        else:
+            results["error"] = f"unknown mode: {mode}"
 
-        # HANDS
-        if "hand" in modalities and self.hands:
-            results["hands"] = self._detect_hands(img)
-
-        # FACE / ATTRIBUTES
-        if ("face" in modalities or "attributes" in modalities) and self.DeepFace:
-            # DeepFace expects path or numpy array (BGR is fine for opencv backend usually, but DeepFace might want RGB)
-            # DeepFace.analyze accepts numpy array (BGR by default if enforce_detection=False?)
-            # Let's convert to RGB for safety.
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            try:
-                # actions: ['age', 'gender', 'race', 'emotion']
-                actions = []
-                if "attributes" in modalities:
-                    actions.extend(['age', 'gender', 'emotion'])
-                
-                # If we just want face detection/recognition, we might use represent or extract_faces
-                # But analyze gives us bounding box + attributes.
-                if actions:
-                    analysis = self.DeepFace.analyze(img_path=img_rgb, actions=actions, enforce_detection=False, silent=True)
-                    if isinstance(analysis, list):
-                        results["faces"] = analysis
-                    else:
-                        results["faces"] = [analysis]
-            except Exception as e:
-                logger.error(f"DeepFace processing error: {e}")
-                results["faces_error"] = str(e)
-
+        self._push_results(mode, results)
         return results
 
-    def _detect_objects(self, img) -> List[Dict]:
-        res = self.yolo_model(img, verbose=False)
-        objects = []
-        for r in res:
-            for box in r.boxes:
-                try:
-                    coords = box.xyxy[0].tolist()
-                    conf = float(box.conf[0])
-                    raw_cls = int(box.cls[0])
-                    label = self.yolo_model.names.get(raw_cls, str(raw_cls))
-                    objects.append({
-                        "label": label,
-                        "confidence": conf,
-                        "bbox": coords
-                    })
-                except: pass
-        return objects
-
-    def _detect_hands(self, img) -> List[Dict]:
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        res = self.hands.process(img_rgb)
-        hands_list = []
-        if res.multi_hand_landmarks:
-            for i, hand_landmarks in enumerate(res.multi_hand_landmarks):
-                # Basic info: which hand (Label), confidence
-                label = "Unknown"
-                score = 0.0
-                if res.multi_handedness:
-                    label = res.multi_handedness[i].classification[0].label
-                    score = res.multi_handedness[i].classification[0].score
-                
-                # Check for simple gestures (e.g. open palm vs fist) - sophisticated gesture logic to be added
-                # For now just return existence
-                hands_list.append({
-                    "label": label,
-                    "confidence": score,
-                    "landmarks_count": len(hand_landmarks.landmark)
-                })
-        return hands_list
+    def _push_results(self, mode: str | None, results: Dict[str, Any]) -> None:
+        if not settings.robot_gateway_url:
+            return
+        objects = results.get("objects")
+        if not objects:
+            return
+        url = f"{settings.robot_gateway_url}/vision/results"
+        payload = {"objects": objects, "mode": mode}
+        headers = {}
+        if settings.robot_vision_auth_token:
+            headers["X-Auth-Token"] = settings.robot_vision_auth_token
+        try:
+            requests.post(url, json=payload, headers=headers, timeout=1.5)
+        except Exception:
+            pass
 
     def health_check(self) -> dict:
         return {
-            "yolo": self.yolo_model is not None,
-            "hands": self.hands is not None,
-            "deepface": self.DeepFace is not None
+            "yolo": self.object_detector.available,
+            "hands": self.hand_detector.available,
+            "deepface": self.face_analyzer.available
         }

@@ -34,3 +34,11 @@ Run the main module from the project root:
 python -m server_app.main
 ```
 Or use the provided `start_server.bat`.
+
+## GUI
+
+PyQt6 masaüstü GUI:
+
+```bash
+python qt_main.py
+```

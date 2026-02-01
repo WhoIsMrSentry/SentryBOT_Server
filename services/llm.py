@@ -18,15 +18,15 @@ class LLMService(BaseService):
         except Exception as e:
             logger.warning(f"Ollama might not be running: {e}")
 
-    def chat(self, prompt: str, system_prompt: str = None) -> str:
-        url = f"{self.base_url}/api/chat"
+    def chat(self, prompt: str, system_prompt: str = None, model: str = None, base_url: str = None) -> str:
+        url = f"{(base_url or self.base_url)}/api/chat"
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
         payload = {
-            "model": self.model,
+            "model": model or self.model,
             "messages": messages,
             "stream": False
         }
