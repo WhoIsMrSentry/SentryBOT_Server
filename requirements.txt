@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+pydantic
+requests
+python-multipart
+# TTS
+piper-tts
+TTS
+torch
+pydub
+# Vision
+ultralytics
+opencv-python
+mediapipe
+deepface
+numpy

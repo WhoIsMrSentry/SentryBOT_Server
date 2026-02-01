@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.env
+env/
+venv/
+venv*/
+.Python
+build/
+dist/
+
+# VSCode
+.vscode/
+
+# Models and large files
+yolov8n.pt
+*.pt
+tts/TTS/PiperTTS/
+tts/TTS/xTTS/tts_env/
+tts/TTS/**/libtashkeel_model.*
+tts/TTS/**/desktop.ini
+
+# pip cache
+pip-wheel-metadata/
+
+# OS
+Thumbs.db
+desktop.ini
+__pycache__
+PiperTTS
+xTTS
+*.wav
+.venv
