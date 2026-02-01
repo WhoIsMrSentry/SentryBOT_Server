@@ -1,8 +1,9 @@
 import os
 try:
     from pydantic_settings import BaseSettings
-except ImportError:
-    from pydantic import BaseSettings
+except Exception:
+    # Pydantic v2 compatibility fallback
+    from pydantic.v1 import BaseSettings
 
 class Settings(BaseSettings):
     # Core
@@ -19,21 +20,29 @@ class Settings(BaseSettings):
     # TTS
     tts_enabled: bool = True
     tts_engine: str = "xtts"  # 'piper' or 'xtts'
+    tts_preload_all: bool = True
     
     # Piper
-    piper_model_path: str = r"C:\Users\emirh\OneDrive\Masaüstü\PiperTTS\GLaDOS\glados_piper_medium.onnx"
+    _base_dir: str = os.path.dirname(__file__)
+    piper_model_path: str = os.path.join(_base_dir, "tts", "TTS", "PiperTTS", "GLaDOS", "glados_piper_medium.onnx")
     # Note: piper binary path might be needed if not in env
     piper_cuda: bool = False
 
     # XTTS
     xtts_model_name: str = "tts_models/multilingual/multi-dataset/xtts_v2"
     xtts_use_gpu: bool = True
+    xtts_preload_on_start: bool = True
+    xtts_max_chars_per_chunk: int = 200
     # Default speaker for XTTS if none provided
-    speaker_wav_path: str = r"c:\Users\emirh\SentryBOT\server_app\tts\TTS\xTTS\ses_kullanılabilir.wav" 
+    speaker_wav_path: str = "" 
 
     # Vision
     vision_enabled: bool = True
     yolo_model_path: str = "yolov8n.pt"
+
+    # Robot Vision Push
+    robot_gateway_url: str = ""  # e.g., http://ROBOT_IP:8080
+    robot_vision_auth_token: str = ""  # optional X-Auth-Token
 
     class Config:
         env_file = ".env"
