@@ -9,10 +9,14 @@ import threading
 import subprocess
 import tempfile
 import winsound
+import sys
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import requests
+import cv2
+import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 from config import settings
 
@@ -67,6 +71,149 @@ class HttpWorker(QtCore.QRunnable):
             self.signals.error.emit(str(exc))
 
 
+class CameraWorker(QtCore.QObject):
+    frame_ready = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, camera_index: int = 0, width: int = 640, height: int = 480, fps: int | None = None):
+        super().__init__()
+        self._running = False
+        self.camera_index = camera_index
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self._cap = None
+
+    @QtCore.pyqtSlot()
+    def start(self):
+        try:
+            import cv2
+            backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+            for backend in backends:
+                self._cap = cv2.VideoCapture(self.camera_index, backend)
+                if self._cap.isOpened():
+                    break
+                try:
+                    self._cap.release()
+                except Exception:
+                    pass
+                self._cap = None
+
+            if self._cap is None or not self._cap.isOpened():
+                self.error.emit("PC kamera açılamadı (backend denemeleri başarısız)")
+                return
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
+            if self.fps:
+                self._cap.set(cv2.CAP_PROP_FPS, float(self.fps))
+            try:
+                self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            self._running = True
+            while self._running:
+                ok, frame = self._cap.read()
+                if ok and frame is not None:
+                    self.frame_ready.emit(frame)
+                if self.fps:
+                    delay_ms = max(1, int(1000 / max(self.fps, 1)))
+                    QtCore.QThread.msleep(delay_ms)
+                else:
+                    QtCore.QThread.msleep(1)
+        except Exception as exc:
+            self.error.emit(str(exc))
+        finally:
+            if self._cap is not None:
+                try:
+                    self._cap.release()
+                except Exception:
+                    pass
+            self._cap = None
+
+    def stop(self):
+        self._running = False
+
+
+class VisionWorker(QtCore.QObject):
+    results_ready = QtCore.pyqtSignal(dict, str)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, frame_getter: Callable[[], Any]):
+        super().__init__()
+        self._running = False
+        self._lock = threading.Lock()
+        self._mode = "none"
+        self._use_local = True
+        self._stream_url = ""
+        self._frame_getter = frame_getter
+        self._svc = None
+
+    def set_mode(self, mode: str):
+        with self._lock:
+            self._mode = mode
+
+    def set_source(self, use_local: bool, stream_url: str):
+        with self._lock:
+            self._use_local = use_local
+            self._stream_url = stream_url or ""
+
+    def stop(self):
+        self._running = False
+
+    @QtCore.pyqtSlot()
+    def start(self):
+        self._running = True
+        try:
+            while self._running:
+                with self._lock:
+                    mode = self._mode
+                    use_local = self._use_local
+                    stream_url = self._stream_url
+
+                if mode == "none":
+                    QtCore.QThread.msleep(50)
+                    continue
+
+                image_bytes = None
+                if use_local:
+                    frame = self._frame_getter()
+                    if frame is not None:
+                        import cv2
+                        ok, buf = cv2.imencode(".jpg", frame)
+                        if ok:
+                            image_bytes = buf.tobytes()
+                else:
+                    if not stream_url:
+                        QtCore.QThread.msleep(50)
+                        continue
+                    try:
+                        import requests
+                        resp = requests.get(stream_url, timeout=5)
+                        if resp.status_code == 200:
+                            image_bytes = resp.content
+                    except Exception:
+                        pass
+
+                if not image_bytes:
+                    QtCore.QThread.msleep(10)
+                    continue
+
+                if self._svc is None:
+                    from services.vision_service import VisionService
+                    self._svc = VisionService()
+                    self._svc.initialize()
+
+                try:
+                    results = self._svc.process_image(image_bytes, mode=mode)
+                    self.results_ready.emit({"ok": True, "results": results, "local": True}, mode)
+                except Exception as exc:
+                    self.error.emit(str(exc))
+
+                QtCore.QThread.msleep(50)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 class RobotControlWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -90,9 +237,19 @@ class RobotControlWindow(QtWidgets.QMainWindow):
         self._ssh_client = None
 
         self._robot_connected = False
-        self._local_cap = None
+        self._camera_thread: Optional[QtCore.QThread] = None
+        self._camera_worker: Optional[CameraWorker] = None
+        self._camera_lock = threading.Lock()
+        self._camera_frame = None
+        self._local_preview_active = False
+        self._analysis_active = False
+        self._analysis_thread: Optional[QtCore.QThread] = None
+        self._analysis_worker: Optional[VisionWorker] = None
 
         self._last_structured: Optional[dict] = None
+        self._last_vision_results: Optional[dict] = None
+        self._last_vision_mode: Optional[str] = None
+        self._local_vision_service = None
 
         self._piper_model = None
         self._piper_model_path = None
@@ -271,10 +428,13 @@ class RobotControlWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(box)
 
         self.use_local_camera = QtWidgets.QCheckBox("PC Kamera Kullan")
+        self.use_local_camera.stateChanged.connect(self._toggle_local_camera)
 
         modes_layout = QtWidgets.QHBoxLayout()
         self.mode_select = QtWidgets.QComboBox()
-        self.mode_select.addItems(["object", "face", "hand", "attributes"])
+        self.mode_select.addItems(["none", "object", "face", "hand", "attributes", "age_emotion", "motion", "finger", "face_recognize"])
+        self.mode_select.setCurrentText("none")
+        self.mode_select.currentTextChanged.connect(self._on_vision_mode_changed)
         modes_layout.addWidget(QtWidgets.QLabel("Mod"))
         modes_layout.addWidget(self.mode_select)
 
@@ -292,9 +452,30 @@ class RobotControlWindow(QtWidgets.QMainWindow):
         self.vision_output = QtWidgets.QTextEdit()
         self.vision_output.setReadOnly(True)
 
+        train_box = QtWidgets.QGroupBox("Yüz Tanıma Eğitimi")
+        train_layout = QtWidgets.QFormLayout(train_box)
+        self.face_name_input = QtWidgets.QLineEdit()
+        self.face_name_input.setPlaceholderText("Kişi adı (ör: owner)")
+        self.face_sample_count = QtWidgets.QSpinBox()
+        self.face_sample_count.setMinimum(3)
+        self.face_sample_count.setMaximum(100)
+        self.face_sample_count.setValue(10)
+        self.face_collect_btn = QtWidgets.QPushButton("Örnek Topla")
+        self.face_collect_btn.clicked.connect(self._collect_face_samples)
+        self.face_encode_btn = QtWidgets.QPushButton("Encoding Oluştur")
+        self.face_encode_btn.clicked.connect(self._build_face_encodings)
+        self.face_train_status = QtWidgets.QLabel("")
+
+        train_layout.addRow("Kişi", self.face_name_input)
+        train_layout.addRow("Örnek Sayısı", self.face_sample_count)
+        train_layout.addRow(self.face_collect_btn)
+        train_layout.addRow(self.face_encode_btn)
+        train_layout.addRow("Durum", self.face_train_status)
+
         layout.addWidget(self.use_local_camera)
         layout.addLayout(modes_layout)
         layout.addLayout(buttons_layout)
+        layout.addWidget(train_box)
         layout.addWidget(self.vision_output)
         return box
 
@@ -469,6 +650,14 @@ class RobotControlWindow(QtWidgets.QMainWindow):
         if hasattr(self, "section_stack"):
             self.section_stack.setCurrentIndex(index)
 
+    def _on_vision_mode_changed(self, mode: str):
+        if self._analysis_active:
+            self._stop_stream_analysis()
+            self._log("İşleme durduruldu (mod değişti)")
+        self._update_camera_state()
+        if mode == "none":
+            self.vision_output.setPlainText("İşleme kapalı (none)")
+
     # ---------------- Helpers ----------------
     def _log(self, msg: str):
         self.log_output.append(msg)
@@ -598,22 +787,90 @@ class RobotControlWindow(QtWidgets.QMainWindow):
         self.thread_pool.start(worker)
 
     # ---------------- Video ----------------
+    def _toggle_local_camera(self):
+        self._update_camera_state()
+
+    def _camera_should_run(self) -> bool:
+        if self._local_preview_active:
+            return True
+        stream_url = self.stream_url.text().strip() if hasattr(self, "stream_url") else ""
+        use_local = self.use_local_camera.isChecked() or not self._robot_connected or not stream_url
+        if self._analysis_active:
+            return use_local
+        if self._stream_timer.isActive():
+            return self.use_local_camera.isChecked() or not stream_url
+        return False
+
+    def _update_camera_state(self):
+        if self._camera_should_run():
+            self._start_local_camera()
+        else:
+            self._stop_local_camera()
+
+    def _start_local_camera(self):
+        if self._camera_thread is not None:
+            return
+        self._camera_thread = QtCore.QThread(self)
+        self._camera_worker = CameraWorker()
+        self._camera_worker.moveToThread(self._camera_thread)
+        self._camera_worker.frame_ready.connect(self._on_camera_frame)
+        self._camera_worker.error.connect(self._on_camera_error)
+        self._camera_thread.started.connect(self._camera_worker.start)
+        self._camera_thread.start()
+
+    def _stop_local_camera(self):
+        if self._camera_worker is not None:
+            self._camera_worker.stop()
+        if self._camera_thread is not None:
+            self._camera_thread.quit()
+            self._camera_thread.wait(1500)
+        self._camera_thread = None
+        self._camera_worker = None
+        with self._camera_lock:
+            self._camera_frame = None
+
+    def _on_camera_frame(self, frame):
+        try:
+            with self._camera_lock:
+                self._camera_frame = frame
+            if self._local_preview_active or self._analysis_active:
+                self._render_local_frame(frame)
+        except Exception:
+            pass
+
+    def _on_camera_error(self, err: str):
+        self._log(f"Kamera hata: {err}")
+
+    def _render_local_frame(self, frame):
+        self._apply_vision_overlay(frame)
+        image = QtGui.QImage(frame.data, frame.shape[1], frame.shape[0], frame.strides[0], QtGui.QImage.Format.Format_BGR888)
+        pix = QtGui.QPixmap.fromImage(image)
+        self.video_label.setPixmap(
+            pix.scaled(
+                self.video_label.size(),
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.FastTransformation,
+            )
+        )
+
     def _start_stream(self):
-        self._stream_timer.start()
+        stream_url = self.stream_url.text().strip() if hasattr(self, "stream_url") else ""
+        if self.use_local_camera.isChecked() or not self._robot_connected or not stream_url:
+            self._local_preview_active = True
+            self._update_camera_state()
+            self._stream_timer.stop()
+        else:
+            self._stream_timer.start()
         self._log("Stream başlatıldı.")
 
     def _stop_stream(self):
+        self._local_preview_active = False
         self._stream_timer.stop()
+        self._update_camera_state()
         self._log("Stream durduruldu.")
 
     def _pull_snapshot(self):
         if self.use_local_camera.isChecked() or not self._robot_connected:
-            frame = self._read_local_frame()
-            if frame is None:
-                return
-            image = QtGui.QImage(frame.data, frame.shape[1], frame.shape[0], frame.strides[0], QtGui.QImage.Format.Format_BGR888)
-            pix = QtGui.QPixmap.fromImage(image)
-            self.video_label.setPixmap(pix.scaled(self.video_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio))
             return
 
         url = self.stream_url.text().strip()
@@ -627,7 +884,13 @@ class RobotControlWindow(QtWidgets.QMainWindow):
             if image.isNull():
                 return
             pix = QtGui.QPixmap.fromImage(image)
-            self.video_label.setPixmap(pix.scaled(self.video_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio))
+            self.video_label.setPixmap(
+                pix.scaled(
+                    self.video_label.size(),
+                    QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                    QtCore.Qt.TransformationMode.FastTransformation,
+                )
+            )
         except Exception:
             pass
 
@@ -636,42 +899,67 @@ class RobotControlWindow(QtWidgets.QMainWindow):
         if self._analysis_busy:
             return
         mode = self.mode_select.currentText()
+        if mode == "none":
+            self.vision_output.setPlainText("İşleme kapalı (none)")
+            return
         self._analysis_busy = True
+        start_for_snapshot = False
+
+        stream_url = self.stream_url.text().strip() if hasattr(self, "stream_url") else ""
+        use_local = self.use_local_camera.isChecked() or not self._robot_connected or not stream_url
+
+        if use_local:
+            if self._camera_thread is None:
+                self._start_local_camera()
+                start_for_snapshot = True
 
         def _do():
-            if self.use_local_camera.isChecked() or not self._robot_connected:
-                frame = self._read_local_frame()
+            if use_local:
+                frame = self._read_local_frame_wait(700)
                 if frame is None:
                     raise RuntimeError("PC kamera okunamadı")
                 import cv2
                 ok, buf = cv2.imencode(".jpg", frame)
                 if not ok:
                     raise RuntimeError("PC kamera encode hata")
-                files = {"file": ("frame.jpg", buf.tobytes(), "image/jpeg")}
+                image_bytes = buf.tobytes()
             else:
-                url = self.stream_url.text().strip()
-                if not url:
-                    raise RuntimeError("Snapshot URL boş")
-                img_resp = requests.get(url, timeout=5)
+                img_resp = requests.get(stream_url, timeout=5)
                 img_resp.raise_for_status()
-                files = {"file": ("frame.jpg", img_resp.content, "image/jpeg")}
-            params = {"mode": mode}
-            res = requests.post(
-                f"{self.server_endpoints.base()}/vision/process",
-                files=files,
-                params=params,
-                timeout=20,
-            )
-            res.raise_for_status()
-            return res.json()
+                image_bytes = img_resp.content
+
+            try:
+                files = {"file": ("frame.jpg", image_bytes, "image/jpeg")}
+                params = {"mode": mode}
+                res = requests.post(
+                    f"{self.server_endpoints.base()}/vision/process",
+                    files=files,
+                    params=params,
+                    timeout=20,
+                )
+                res.raise_for_status()
+                return res.json()
+            except Exception:
+                results = self._process_locally(image_bytes, mode)
+                return results
 
         def _done(data):
             self._analysis_busy = False
             self.vision_output.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
+            self._last_vision_results = data
+            self._last_vision_mode = mode
+            if start_for_snapshot and not self._camera_should_run():
+                self._stop_local_camera()
+            self._update_camera_state()
 
         def _err(e):
             self._analysis_busy = False
             self.vision_output.setPlainText(f"Error: {e}")
+            self._last_vision_results = None
+            self._last_vision_mode = None
+            if start_for_snapshot and not self._camera_should_run():
+                self._stop_local_camera()
+            self._update_camera_state()
 
         worker = HttpWorker(_do)
         worker.signals.done.connect(_done)
@@ -679,27 +967,291 @@ class RobotControlWindow(QtWidgets.QMainWindow):
         self.thread_pool.start(worker)
 
     def _start_stream_analysis(self):
-        self._analysis_timer.start()
+        if self.mode_select.currentText() == "none":
+            self._log("İşleme kapalı (none). Sadece stream gösteriliyor.")
+            self._start_stream()
+            return
+        self._analysis_active = True
+        self._update_analysis_worker()
+        self._update_camera_state()
         self._log("Vision stream analizi başladı.")
 
     def _stop_stream_analysis(self):
-        self._analysis_timer.stop()
+        self._analysis_active = False
+        self._analysis_busy = False
+        if self._analysis_worker is not None:
+            self._analysis_worker.stop()
+        if self._analysis_thread is not None:
+            self._analysis_thread.quit()
+            self._analysis_thread.wait(1500)
+        self._analysis_worker = None
+        self._analysis_thread = None
+        self._update_camera_state()
         self._log("Vision stream analizi durdu.")
 
-    def _ensure_local_camera(self):
-        if self._local_cap is None:
-            import cv2
-            self._local_cap = cv2.VideoCapture(0)
-        return self._local_cap
-
     def _read_local_frame(self):
-        cap = self._ensure_local_camera()
-        if cap is None:
-            return None
-        ok, frame = cap.read()
-        if not ok:
-            return None
-        return frame
+        with self._camera_lock:
+            if self._camera_frame is None:
+                return None
+            return self._camera_frame.copy()
+
+    def _read_local_frame_wait(self, timeout_ms: int = 500):
+        waited = 0
+        step = 50
+        while waited <= timeout_ms:
+            frame = self._read_local_frame()
+            if frame is not None:
+                return frame
+            QtCore.QThread.msleep(step)
+            waited += step
+        return None
+
+    def _apply_vision_overlay(self, frame) -> None:
+        if not self._last_vision_results or not self._last_vision_mode:
+            return
+        if self._last_vision_mode == "none":
+            return
+        try:
+            import cv2
+            h, w = frame.shape[:2]
+            mode = self._last_vision_mode
+            results = self._last_vision_results.get("results") or self._last_vision_results
+
+            if mode == "object":
+                for obj in results.get("objects", []):
+                    bbox = obj.get("bbox") or []
+                    if len(bbox) == 4:
+                        x1, y1, x2, y2 = map(int, bbox)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        label = f"{obj.get('label', '')} {obj.get('confidence', 0):.2f}"
+                        cv2.putText(frame, label, (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            elif mode in ("face", "attributes"):
+                for face in results.get("faces", []):
+                    area = face.get("facial_area") or face.get("region") or {}
+                    x = int(area.get("x", 0))
+                    y = int(area.get("y", 0))
+                    w0 = int(area.get("w", 0))
+                    h0 = int(area.get("h", 0))
+                    if w0 > 0 and h0 > 0:
+                        cv2.rectangle(frame, (x, y), (x + w0, y + h0), (255, 0, 0), 2)
+
+            elif mode == "age_emotion":
+                for face in results.get("faces", []):
+                    bbox = face.get("bbox") or []
+                    if len(bbox) == 4:
+                        x, y, w0, h0 = map(int, bbox)
+                        cv2.rectangle(frame, (x, y), (x + w0, y + h0), (0, 200, 255), 2)
+                        label = f"{face.get('age', '?')} | {face.get('emotion', '?')}"
+                        cv2.putText(frame, label, (x, max(0, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+
+            elif mode == "hand":
+                connections = [
+                    (0, 1), (1, 2), (2, 3), (3, 4),
+                    (0, 5), (5, 6), (6, 7), (7, 8),
+                    (5, 9), (9, 10), (10, 11), (11, 12),
+                    (9, 13), (13, 14), (14, 15), (15, 16),
+                    (13, 17), (17, 18), (18, 19), (19, 20),
+                    (0, 17),
+                ]
+                for hand in results.get("hands", []):
+                    landmarks = hand.get("landmarks") or []
+                    pts = []
+                    for lm in landmarks:
+                        x = int((lm.get("x", 0.0)) * w)
+                        y = int((lm.get("y", 0.0)) * h)
+                        pts.append((x, y))
+                        cv2.circle(frame, (x, y), 2, (0, 255, 255), -1)
+                    for a, b in connections:
+                        if a < len(pts) and b < len(pts):
+                            cv2.line(frame, pts[a], pts[b], (0, 255, 255), 1)
+
+            elif mode == "motion":
+                motion = results.get("motion", {})
+                for (x, y, w0, h0) in motion.get("areas", []):
+                    cv2.rectangle(frame, (int(x), int(y)), (int(x + w0), int(y + h0)), (0, 255, 0), 2)
+
+            elif mode == "finger":
+                gesture = results.get("gesture", {})
+                hands = gesture.get("hands", [])
+                finger_tip_ids = [4, 8, 12, 16, 20]
+                connections = [
+                    (0, 1), (1, 2), (2, 3), (3, 4),
+                    (0, 5), (5, 6), (6, 7), (7, 8),
+                    (5, 9), (9, 10), (10, 11), (11, 12),
+                    (9, 13), (13, 14), (14, 15), (15, 16),
+                    (13, 17), (17, 18), (18, 19), (19, 20),
+                    (0, 17),
+                ]
+                colors = [
+                    (0, 0, 255), (0, 255, 255), (255, 0, 0), (0, 255, 0), (255, 0, 255),
+                    (0, 165, 255), (203, 192, 255), (255, 255, 0), (255, 255, 255), (0, 255, 127),
+                ]
+                for hand_idx, hand in enumerate(hands[:2]):
+                    landmarks = hand.get("landmarks") or []
+                    state = hand.get("state") or "00000"
+                    pts = []
+                    for lm in landmarks:
+                        x = int(lm.get("x", 0.0) * w)
+                        y = int(lm.get("y", 0.0) * h)
+                        pts.append((x, y))
+                    for a, b in connections:
+                        if a < len(pts) and b < len(pts):
+                            cv2.line(frame, pts[a], pts[b], (0, 255, 0), 2)
+                    for i, tip_id in enumerate(finger_tip_ids):
+                        if i < len(state) and state[i] == "1" and tip_id < len(landmarks):
+                            x, y = pts[tip_id]
+                            color_idx = hand_idx * 5 + i
+                            cv2.circle(frame, (x, y), 12, colors[color_idx], cv2.FILLED)
+                        elif tip_id < len(landmarks):
+                            x, y = pts[tip_id]
+                            cv2.circle(frame, (x, y), 6, (90, 90, 90), cv2.FILLED)
+
+            elif mode == "face_recognize":
+                for face in results.get("faces", []):
+                    bbox = face.get("bbox") or []
+                    if len(bbox) == 4:
+                        x, y, w0, h0 = map(int, bbox)
+                        cv2.rectangle(frame, (x, y), (x + w0, y + h0), (255, 180, 0), 2)
+                        name = face.get("name", "unknown")
+                        cv2.putText(frame, name, (x, max(0, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 180, 0), 1)
+        except Exception:
+            pass
+
+    # ---------------- Face Training ----------------
+    def _collect_face_samples(self):
+        name = self.face_name_input.text().strip()
+        if not name:
+            self.face_train_status.setText("Kişi adı boş")
+            return
+        count = int(self.face_sample_count.value())
+        if count <= 0:
+            self.face_train_status.setText("Örnek sayısı geçersiz")
+            return
+
+        base_dir = os.path.join(os.path.dirname(__file__), "models", "faces", name)
+        os.makedirs(base_dir, exist_ok=True)
+
+        start_for_capture = False
+        if self.use_local_camera.isChecked() or not self._robot_connected:
+            if self._camera_thread is None:
+                self._start_local_camera()
+                start_for_capture = True
+
+        self.face_train_status.setText("Örnekler toplanıyor...")
+        self.face_collect_btn.setEnabled(False)
+
+        def _do():
+            saved = 0
+            for i in range(count):
+                if self.use_local_camera.isChecked() or not self._robot_connected:
+                    frame = self._read_local_frame_wait(1500)
+                    if frame is None:
+                        continue
+                else:
+                    url = self.stream_url.text().strip()
+                    if not url:
+                        raise RuntimeError("Snapshot URL boş")
+                    img_resp = requests.get(url, timeout=5)
+                    img_resp.raise_for_status()
+                    data = np.frombuffer(img_resp.content, np.uint8)
+                    frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                    if frame is None:
+                        continue
+
+                filename = os.path.join(base_dir, f"{int(time.time()*1000)}_{i}.jpg")
+                cv2.imwrite(filename, frame)
+                saved += 1
+                time.sleep(0.15)
+            return saved
+
+        def _done(saved: int):
+            self.face_train_status.setText(f"{saved} örnek kaydedildi")
+            self.face_collect_btn.setEnabled(True)
+            if start_for_capture and not self._camera_should_run():
+                self._stop_local_camera()
+
+        def _err(e: str):
+            self.face_train_status.setText(f"Hata: {e}")
+            self.face_collect_btn.setEnabled(True)
+            if start_for_capture and not self._camera_should_run():
+                self._stop_local_camera()
+
+        worker = HttpWorker(_do)
+        worker.signals.done.connect(_done)
+        worker.signals.error.connect(_err)
+        self.thread_pool.start(worker)
+
+    def _build_face_encodings(self):
+        script_path = os.path.join(os.path.dirname(__file__), "tools", "build_face_encodings.py")
+        if not os.path.exists(script_path):
+            self.face_train_status.setText("Encoding script bulunamadı")
+            return
+
+        self.face_train_status.setText("Encoding oluşturuluyor...")
+        self.face_encode_btn.setEnabled(False)
+
+        def _do():
+            proc = subprocess.run(
+                [sys.executable, script_path],
+                capture_output=True,
+                text=True,
+                cwd=os.path.dirname(__file__),
+                timeout=180,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "Encoding hata")
+            return proc.stdout.strip()
+
+        def _done(msg: str):
+            self.face_train_status.setText("Encoding tamamlandı")
+            if msg:
+                self._log(msg)
+            self.face_encode_btn.setEnabled(True)
+
+        def _err(e: str):
+            self.face_train_status.setText(f"Hata: {e}")
+            self.face_encode_btn.setEnabled(True)
+
+        worker = HttpWorker(_do)
+        worker.signals.done.connect(_done)
+        worker.signals.error.connect(_err)
+        self.thread_pool.start(worker)
+
+    def _get_local_vision_service(self):
+        if self._local_vision_service is None:
+            from services.vision_service import VisionService
+            svc = VisionService()
+            svc.initialize()
+            self._local_vision_service = svc
+        return self._local_vision_service
+
+    def _process_locally(self, image_bytes: bytes, mode: str) -> dict:
+        svc = self._get_local_vision_service()
+        results = svc.process_image(image_bytes, mode=mode)
+        return {"ok": True, "results": results, "local": True}
+
+    def _update_analysis_worker(self):
+        mode = self.mode_select.currentText()
+        stream_url = self.stream_url.text().strip() if hasattr(self, "stream_url") else ""
+        use_local = self.use_local_camera.isChecked() or not self._robot_connected or not stream_url
+
+        if self._analysis_worker is None:
+            self._analysis_thread = QtCore.QThread(self)
+            self._analysis_worker = VisionWorker(self._read_local_frame)
+            self._analysis_worker.moveToThread(self._analysis_thread)
+            self._analysis_worker.results_ready.connect(self._on_analysis_result)
+            self._analysis_worker.error.connect(lambda e: self.vision_output.setPlainText(f"Error: {e}"))
+            self._analysis_thread.started.connect(self._analysis_worker.start)
+            self._analysis_thread.start()
+
+        self._analysis_worker.set_mode(mode)
+        self._analysis_worker.set_source(use_local, stream_url)
+
+    def _on_analysis_result(self, data: dict, mode: str):
+        self._last_vision_results = data
+        self._last_vision_mode = mode
+        self.vision_output.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
 
     # ---------------- TTS ----------------
     def _load_piper_voices(self):
@@ -1238,39 +1790,6 @@ class RobotControlWindow(QtWidgets.QMainWindow):
         user = match.group(1)
         host = match.group(2)
         password = match.group(3)
-        try:
-            audio_chunks = self._piper_model.synthesize(text)
-            return b"".join(chunk.audio_int16_bytes for chunk in audio_chunks)
-        except Exception as exc:
-            if "espeakbridge" not in str(exc).lower():
-                raise
-
-        base_dir = os.path.join(os.path.dirname(__file__), "tts", "TTS", "PiperTTS")
-        exe_path = os.path.join(base_dir, "piper.exe")
-        if not os.path.exists(exe_path):
-            raise RuntimeError("Piper CLI bulunamadı")
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            tmp_path = tmp.name
-
-        try:
-            cmd = [exe_path, "--model", path, "--output_file", tmp_path]
-            subprocess.run(
-                cmd,
-                input=text,
-                text=True,
-                check=True,
-                cwd=base_dir,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            with open(tmp_path, "rb") as f:
-                return f.read()
-        finally:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
         def _do():
             import paramiko
             client = paramiko.SSHClient()
@@ -1319,8 +1838,7 @@ class RobotControlWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         try:
-            if self._local_cap is not None:
-                self._local_cap.release()
+            self._stop_local_camera()
         except Exception:
             pass
         try:

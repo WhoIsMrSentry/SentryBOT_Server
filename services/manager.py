@@ -1,7 +1,7 @@
 from services.tts.piper import PiperService
 from services.tts.xtts import XTTSService
 from services.llm import LLMService
-from services.vision import VisionService
+from services.vision_service import VisionService
 from config import settings
 import logging
 
