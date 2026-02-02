@@ -33,3 +33,8 @@ PiperTTS
 xTTS
 *.wav
 .venv
+*.onnx
+*.caffemodel
+*.prototxt
+*.xml
+*.pickle
