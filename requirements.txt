@@ -4,13 +4,11 @@ pydantic
 pydantic-settings
 requests
 python-multipart
-nicegui
-httpx
 paramiko
 PyQt6
 # TTS
 piper-tts
-piper-phonemize
+#piper-phonemize
 TTS==0.22.0
 transformers==4.35.2
 torch
@@ -18,7 +16,8 @@ pydub
 onnxruntime==1.16.3
 # Vision
 ultralytics
-opencv-python
-mediapipe
+opencv-contrib-python
+mediapipe==0.10.14
 deepface
-numpy
+numpy<2
+face_recognition
