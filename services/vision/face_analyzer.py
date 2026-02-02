@@ -36,8 +36,8 @@ class FaceAnalyzer:
                     silent=True,
                 )
                 if isinstance(analysis, list):
-                    return analysis
-                return [analysis]
+                    return [self._normalize_attributes(item) for item in analysis]
+                return [self._normalize_attributes(analysis)]
             # face only
             faces = self.DeepFace.extract_faces(img_path=img_rgb, enforce_detection=False)
             out = []
@@ -51,3 +51,10 @@ class FaceAnalyzer:
         except Exception as e:
             logger.error(f"DeepFace processing error: {e}")
             return [{"error": str(e)}]
+
+    def _normalize_attributes(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(item)
+        region = item.get("region") or {}
+        if "facial_area" not in out and region:
+            out["facial_area"] = region
+        return out

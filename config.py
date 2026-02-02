@@ -39,6 +39,16 @@ class Settings(BaseSettings):
     # Vision
     vision_enabled: bool = True
     yolo_model_path: str = "yolov8n.pt"
+    vision_face_model_path: str = os.path.join(_base_dir, "models", "face_detection_yunet_2023mar.onnx")
+    vision_age_model_path: str = os.path.join(_base_dir, "models", "age_net.caffemodel")
+    vision_age_proto_path: str = os.path.join(_base_dir, "models", "age_deploy.prototxt")
+    vision_emotion_model_path: str = os.path.join(_base_dir, "models", "emotion-ferplus-8.onnx")
+    vision_face_cascade_path: str = os.path.join(_base_dir, "models", "haarcascade_frontalface_default.xml")
+    vision_face_dataset_dir: str = os.path.join(_base_dir, "models", "faces")
+    vision_face_recognize_threshold: float = 70.0
+    vision_owner_name: str = "owner"
+    vision_face_encodings_path: str = os.path.join(_base_dir, "models", "encodings.pickle")
+    vision_face_encoding_tolerance: float = 0.6
 
     # Robot Vision Push
     robot_gateway_url: str = ""  # e.g., http://ROBOT_IP:8080

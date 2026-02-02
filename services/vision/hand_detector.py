@@ -41,9 +41,14 @@ class HandDetector:
                 if res.multi_handedness:
                     label = res.multi_handedness[i].classification[0].label
                     score = res.multi_handedness[i].classification[0].score
+                landmarks = [
+                    {"x": lm.x, "y": lm.y, "z": lm.z}
+                    for lm in hand_landmarks.landmark
+                ]
                 hands_list.append({
                     "label": label,
                     "confidence": score,
                     "landmarks_count": len(hand_landmarks.landmark),
+                    "landmarks": landmarks,
                 })
         return hands_list
